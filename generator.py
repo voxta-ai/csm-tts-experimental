@@ -5,7 +5,9 @@ import time
 from collections import OrderedDict
 
 import torch
-from models import Model
+import numpy as np
+from safetensors.torch import load_file
+from models import Model, ModelArgs
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
@@ -16,8 +18,8 @@ logger = logging.getLogger(__name__)
 class Segment:
     speaker: int
     text: str
-    audio: torch.Tensor = None
-    audio_path: str = ""
+    tokens: Optional[torch.Tensor] = None
+    masks: Optional[torch.Tensor] = None
 
 def load_llama3_tokenizer(llama_model_path: str):
     """
@@ -41,7 +43,6 @@ class Generator:
         llama_model_path: str,
         mimi_model_path: str,
     ):
-        self._segment_cache = OrderedDict()
         self._model = model
         self._model.setup_caches(1)
 
@@ -54,6 +55,8 @@ class Generator:
 
         self.sample_rate = mimi.sample_rate
         self.device = device
+
+        self._cache = OrderedDict()
 
     def _tokenize_text_segment(self, text: str, speaker: int) -> Tuple[torch.Tensor, torch.Tensor]:
         frame_tokens = []
@@ -70,7 +73,7 @@ class Generator:
 
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
-    def _tokenize_audio(self, audio: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         assert audio.ndim == 1, "Audio must be single channel"
 
         frame_tokens = []
@@ -93,33 +96,41 @@ class Generator:
 
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
-    def _tokenize_segment(self, segment: Segment) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_segment(self, speaker: int, text: str, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             (seq_len, 33), (seq_len, 33)
         """
-        key = (segment.audio_path, segment.speaker, segment.text)
-        if key in self._segment_cache:
-            # Move to end for LRU behavior
-            tokens_masks = self._segment_cache.pop(key)
-            self._segment_cache[key] = tokens_masks
-            logger.debug(f"Loaded segment from cache")
-            return tokens_masks
-
         st = time.time()
-        text_tokens, text_masks = self._tokenize_text_segment(segment.text, segment.speaker)
-        audio_tokens, audio_masks = self._tokenize_audio(segment.audio)
+        text_tokens, text_masks = self._tokenize_text_segment(text, speaker)
+        audio_tokens, audio_masks = self._tokenize_audio(audio)
 
         out_tokens = torch.cat([text_tokens, audio_tokens], dim=0)
         out_masks = torch.cat([text_masks, audio_masks], dim=0)
 
-        # Cache and enforce a limit of 8
-        if len(self._segment_cache) >= 8:
-            self._segment_cache.popitem(last=False)
-        self._segment_cache[key] = (out_tokens, out_masks)
         logger.debug(f"Tokenized segment ({time.time() - st:.2f}s)")
 
         return out_tokens, out_masks
+    
+    def get_segment(self, speaker: int, text: str) -> Optional[Segment]:
+        key = (speaker, text)
+        if key in self._cache:
+            # Move to end for LRU behavior
+            segment = self._cache.pop(key)
+            self._cache[key] = segment
+            logger.debug(f"Loaded segment from cache")
+            return segment
+        return None
+    
+    def create_segment(self, speaker: int, text: str, audio: Optional[torch.Tensor]) -> Segment:
+        if audio is None:
+            audio = torch.zeros(0, device=self.device)
+        tokens, masks = self._tokenize_segment(speaker, text, audio)
+        segment = Segment(speaker=speaker, text=text, tokens=tokens, masks=masks)
+        if len(self._cache) >= 8:
+            self._cache.popitem(last=False)
+        self._cache[(speaker, text)] = segment
+        return segment
 
     @torch.inference_mode()
     def generate_stream(
@@ -136,9 +147,8 @@ class Generator:
         max_generation_len = int(max_audio_length_ms / 80)
         tokens, tokens_mask = [], []
         for segment in context:
-            segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
-            tokens.append(segment_tokens)
-            tokens_mask.append(segment_tokens_mask)
+            tokens.append(segment.tokens)
+            tokens_mask.append(segment.masks)
 
         gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(text, speaker)
         tokens.append(gen_segment_tokens)
@@ -172,8 +182,14 @@ class Generator:
         first_chunk = False
         counter = 0
         batch_size = 10
-        buffer_size = 30
+        buffer_size = 20 # 1.6s
+        skip_silence_duration = 1.6
+        stop_silence_duration = 4.8
+        silence_threshold = 0.05
+        sample_rate = 24000
         frame_buffer = []
+        out_tokens = []
+        out_masks = []
         with self._audio_tokenizer.streaming(batch_size=1):
             i = 0
             while i < max_generation_len:
@@ -193,6 +209,19 @@ class Generator:
                     batch_samples.append(sample)
                     update_tokens(sample)
 
+                    out_tokens.append(
+                        torch.cat([
+                            sample, # shape (1, num_codebooks)
+                            torch.zeros(1, self._audio_tokenizer.num_codebooks + 1 - sample.shape[1], device=sample.device, dtype=torch.long)
+                        ], dim=1) # shape (1, 33)
+                    )
+                    out_masks.append(
+                        torch.cat([
+                            torch.ones(1, sample.shape[1], device=sample.device, dtype=torch.bool),
+                            torch.zeros(1, self._audio_tokenizer.num_codebooks + 1 - sample.shape[1], device=sample.device, dtype=torch.bool)
+                        ], dim=1) # shape (1, 33)
+                    )
+
                 if not batch_samples:
                     break
 
@@ -203,12 +232,29 @@ class Generator:
                     frames_stacked = torch.stack(frame_buffer).permute(1, 2, 0)
                     audio_chunk = self._audio_tokenizer.decode(frames_stacked).squeeze(0).squeeze(0)
                     frame_buffer = []
-                    yield audio_chunk.cpu()
+
+                    # Check for silence in the decoded chunk
+                    audio_np = audio_chunk.cpu().numpy()
+                    chunk_duration = audio_np.shape[0] / sample_rate
+                    if np.max(np.abs(audio_np)) < silence_threshold:
+                        silence_duration_counter += chunk_duration
+                        if silence_duration_counter > stop_silence_duration:
+                            logger.warning(f"Silence detected for {silence_duration_counter}s, skipping {chunk_duration}s and stopping generation")
+                            break
+                        elif silence_duration_counter > skip_silence_duration:
+                            logger.info(f"Silence detected for {silence_duration_counter}s, skipping {chunk_duration}s chunk")
+                            pass
+                        else:
+                            logger.info(f"Silence detected in {chunk_duration}s chunk")
+                            yield audio_chunk.cpu()
+                    else:
+                        silence_duration_counter = 0.0
+                        yield audio_chunk.cpu()
+
                     if not first_chunk:
                         first_chunk = True
-                        logger.info("First chunk: %.2f seconds", time.monotonic() - st)
+                        logger.info(f"First chunk: {time.monotonic() - st:.2f} seconds, {counter} samples", )
 
-                # Why?
                 if i >= 100 and (i % 100 == 0):
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -216,10 +262,25 @@ class Generator:
         if frame_buffer:
             frames_stacked = torch.stack(frame_buffer).permute(1, 2, 0)
             audio_chunk = self._audio_tokenizer.decode(frames_stacked).squeeze(0).squeeze(0)
-            cpu_chunk = audio_chunk.cpu()
-            yield cpu_chunk
+            audio_np = audio_chunk.cpu().numpy()
+            chunk_duration = audio_np.shape[0] / sample_rate
+            if np.max(np.abs(audio_np)) < silence_threshold:
+                silence_duration_counter += chunk_duration
+                if silence_duration_counter <= skip_silence_duration:
+                    yield audio_chunk.cpu()
+            else:
+                yield audio_chunk.cpu()
 
         print(f"Total time: {time.monotonic() - st:.2f} seconds ({counter} samples)")
+        
+        gen_audio_tokens = torch.cat(out_tokens, dim=0)
+        gen_audio_masks = torch.cat(out_masks, dim=0)
+        all_tokens = torch.cat([gen_segment_tokens, gen_audio_tokens], dim=0)
+        all_masks = torch.cat([gen_segment_tokens_mask, gen_audio_masks], dim=0)
+        generated_segment = Segment(speaker=speaker, text=text, tokens=all_tokens, masks=all_masks)
+        if len(self._cache) >= 8:
+            self._cache.popitem(last=False)
+        self._cache[(speaker, text)] = generated_segment
 
 def load_csm_1b(
         csm_model_path: str,
@@ -228,17 +289,24 @@ def load_csm_1b(
         device: str = "cuda",
         ) -> Generator:
     logger.info("Loading CSM 1B model from %s", csm_model_path)
+    
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.enabled = True
 
-    model = Model.from_pretrained(csm_model_path, local_files_only=True)
+    model_args = ModelArgs(
+        backbone_flavor="llama-1B",
+        decoder_flavor="llama-100M",
+        text_vocab_size=128256,
+        audio_vocab_size=2051,
+        audio_num_codebooks=32,
+    )
+    model = Model(config=model_args).to(device=device, dtype=torch.bfloat16)
+    state_dict = load_file(csm_model_path)
 
-    # model = torch.compile(
-    #     model,
-    #     dynamic=True,
-    #     fullgraph=True,
-    #     backend='cudagraphs'
-    # )
-
-    model.to(device=device, dtype=torch.bfloat16)
+    model.load_state_dict(state_dict)
+    model.decoder = torch.compile(model.decoder, fullgraph=True, backend='cudagraphs')
+    model.forward = torch.compile(model.forward, mode="max-autotune")
 
     generator = Generator(model, llama_model_path, mimi_model_path)
     return generator

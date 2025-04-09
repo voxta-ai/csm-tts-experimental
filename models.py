@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torchtune
 from torchtune.models import llama3_2
-from huggingface_hub import PyTorchModelHubMixin
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +88,7 @@ class ModelArgs:
     audio_vocab_size: int
     audio_num_codebooks: int
 
-class Model(
-    nn.Module,
-    PyTorchModelHubMixin,
-    repo_url="https://github.com/SesameAILabs/csm",
-    pipeline_tag="text-to-speech",
-    license="apache-2.0",
-):
+class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config

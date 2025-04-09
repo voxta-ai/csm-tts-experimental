@@ -43,7 +43,14 @@ class CSMTest:
         self.text = args.text
         self.max_duration = args.max_duration
 
-        self.context = [Segment(speaker=0, audio=self.load_audio(args.voice_wav), audio_path=args.voice_wav, text=args.voice_transcript)]
+        voice_audio =self.load_audio(args.voice_wav)
+        initial_segment = self.generator.create_segment(
+            speaker=0,
+            text=args.voice_transcript,
+            audio=voice_audio,
+        )
+
+        self.context = [initial_segment]
 
         os.makedirs(self.output_path, exist_ok=True)
 
