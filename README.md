@@ -18,7 +18,7 @@ pip3 install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch
 # Install the requirements
 pip3 install -r requirements.txt
 # Run the test
-python test.py --model-path path/to/model.gguf --snac-path path/to/snac-folder --output-path path/to-outputs
+python test.py --csm-model-path "C:\Models\csm-1b\model.safetensors" --mimi-path "C:\Models\moshiko-pytorch-bf16\tokenizer-e351c8d8-checkpoint125.safetensors" --llama-path "C:\Models\Llama-3.2-1B" --output-path C:\Temp --voice-wav "C:\VoiceSamples\Example.wav" --voice-transcript "Transcription of the voice wav." --max-duration 5 --num-codebooks 16 --runs 5 --play-test
 ```
 
 For arguments, see [test.py](./test.py)
