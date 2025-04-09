@@ -1,11 +1,13 @@
+import logging
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torchtune
-from huggingface_hub import PyTorchModelHubMixin
 from torchtune.models import llama3_2
+from huggingface_hub import PyTorchModelHubMixin
 
+logger = logging.getLogger(__name__)
 
 def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
     return llama3_2.llama3_2(
@@ -22,7 +24,6 @@ def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
         scale_factor=32,
     )
 
-
 def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
     return llama3_2.llama3_2(
         vocab_size=128_256,
@@ -38,12 +39,10 @@ def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
         scale_factor=32,
     )
 
-
 FLAVORS = {
     "llama-1B": llama3_2_1B,
     "llama-100M": llama3_2_100M,
 }
-
 
 def _prepare_transformer(model):
     embed_dim = model.tok_embeddings.embedding_dim
@@ -51,10 +50,8 @@ def _prepare_transformer(model):
     model.output = nn.Identity()
     return model, embed_dim
 
-
 def _create_causal_mask(seq_len: int, device: torch.device):
     return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-
 
 def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     """
@@ -68,11 +65,9 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     r = mask[input_pos, :]
     return r
 
-
 def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs).exponential_(1)
     return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
-
 
 def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
     logits = logits / temperature
@@ -86,7 +81,6 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
     sample_token = _multinomial_sample_one_no_sync(probs)
     return sample_token
 
-
 @dataclass
 class ModelArgs:
     backbone_flavor: str
@@ -94,7 +88,6 @@ class ModelArgs:
     text_vocab_size: int
     audio_vocab_size: int
     audio_num_codebooks: int
-
 
 class Model(
     nn.Module,

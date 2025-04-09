@@ -14,7 +14,7 @@ You also need to download:
 python -m venv env
 venv\Scripts\activate 
 # Install torch 2.6 if you don't already have it
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip3 install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 # Install the requirements
 pip3 install -r requirements.txt
 # Run the test
@@ -25,6 +25,6 @@ For arguments, see [test.py](./test.py)
 
 ## License
 
-Inherited from Canopy Labs Orpheus TTS.
+Inherited from Sesame CSM.
 
-[Apache-2.0 License](https://github.com/canopyai/Orpheus-TTS?tab=Apache-2.0-1-ov-file)
+[Apache-2.0 License](https://github.com/SesameAILabs/csm?tab=Apache-2.0-1-ov-file)

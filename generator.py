@@ -1,30 +1,30 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Iterator
+import logging
+import time
+from collections import OrderedDict
 
 import torch
-import torchaudio
-from huggingface_hub import hf_hub_download
-from models import Model
+from safetensors.torch import load_file
+from models import Model, ModelArgs
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
-from watermarking import CSM_1B_GH_WATERMARK, load_watermarker, watermark
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Segment:
     speaker: int
     text: str
-    # (num_samples,), sample_rate = 24_000
-    audio: torch.Tensor
+    audio: torch.Tensor = None
+    audio_path: str = ""
 
-
-def load_llama3_tokenizer():
+def load_llama3_tokenizer(llama_model_path: str):
     """
     https://github.com/huggingface/transformers/issues/22794#issuecomment-2092623992
     """
-    tokenizer_name = "meta-llama/Llama-3.2-1B"
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path, local_files_only=True)
     bos = tokenizer.bos_token
     eos = tokenizer.eos_token
     tokenizer._tokenizer.post_processor = TemplateProcessing(
@@ -35,24 +35,23 @@ def load_llama3_tokenizer():
 
     return tokenizer
 
-
 class Generator:
     def __init__(
         self,
         model: Model,
+        llama_model_path: str,
+        mimi_model_path: str,
     ):
+        self._segment_cache = OrderedDict()
         self._model = model
         self._model.setup_caches(1)
 
-        self._text_tokenizer = load_llama3_tokenizer()
+        self._text_tokenizer = load_llama3_tokenizer(llama_model_path)
 
         device = next(model.parameters()).device
-        mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
-        mimi = loaders.get_mimi(mimi_weight, device=device)
+        mimi = loaders.get_mimi(mimi_model_path, device=device)
         mimi.set_num_codebooks(32)
         self._audio_tokenizer = mimi
-
-        self._watermarker = load_watermarker(device=device)
 
         self.sample_rate = mimi.sample_rate
         self.device = device
@@ -72,7 +71,7 @@ class Generator:
 
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
-    def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_audio(self, audio: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         assert audio.ndim == 1, "Audio must be single channel"
 
         frame_tokens = []
@@ -100,21 +99,39 @@ class Generator:
         Returns:
             (seq_len, 33), (seq_len, 33)
         """
+        key = (segment.audio_path, segment.speaker, segment.text)
+        if key in self._segment_cache:
+            # Move to end for LRU behavior
+            tokens_masks = self._segment_cache.pop(key)
+            self._segment_cache[key] = tokens_masks
+            logger.debug(f"Loaded segment from cache")
+            return tokens_masks
+
+        st = time.time()
         text_tokens, text_masks = self._tokenize_text_segment(segment.text, segment.speaker)
         audio_tokens, audio_masks = self._tokenize_audio(segment.audio)
 
-        return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
+        out_tokens = torch.cat([text_tokens, audio_tokens], dim=0)
+        out_masks = torch.cat([text_masks, audio_masks], dim=0)
+
+        # Cache and enforce a limit of 8
+        if len(self._segment_cache) >= 8:
+            self._segment_cache.popitem(last=False)
+        self._segment_cache[key] = (out_tokens, out_masks)
+        logger.debug(f"Tokenized segment ({time.time() - st:.2f}s)")
+
+        return out_tokens, out_masks
 
     @torch.inference_mode()
-    def generate(
+    def generate_stream(
         self,
         text: str,
         speaker: int,
         context: List[Segment],
         max_audio_length_ms: float = 90_000,
-        temperature: float = 0.9,
-        topk: int = 50,
-    ) -> torch.Tensor:
+        temperature: float = 0.7,
+        topk: int = 30,
+    ) -> Iterator[torch.Tensor]:
         self._model.reset_caches()
 
         max_generation_len = int(max_audio_length_ms / 80)
@@ -131,7 +148,6 @@ class Generator:
         prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
         prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
 
-        samples = []
         curr_tokens = prompt_tokens.unsqueeze(0)
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
@@ -142,35 +158,66 @@ class Generator:
             raise ValueError(
                 f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
             )
+        
+        BATCH_SIZE = 10
+        BUFFER_SIZE = 10
+        buffer = []
 
-        for _ in range(max_generation_len):
-            sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-            if torch.all(sample == 0):
-                break  # eos
+        st = time.monotonic()
+        first_sample = False
+        first_chunk = False
+        counter = 0
+        with self._audio_tokenizer.streaming(1):
+            for _ in range(max_generation_len):
+                sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                counter += 1
+                if not first_sample:
+                    first_sample = True
+                    print(f"First sample: {time.monotonic() - st:.2f} seconds")
+                if torch.all(sample == 0):
+                    break  # eos
 
-            samples.append(sample)
+                buffer.append(sample)
 
-            curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
-            curr_tokens_mask = torch.cat(
-                [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
-            ).unsqueeze(1)
-            curr_pos = curr_pos[:, -1:] + 1
+                if(len(buffer) >= BUFFER_SIZE):
+                    audio = self._audio_tokenizer.decode(torch.stack(buffer).permute(1, 2, 0)).squeeze(0).squeeze(0)
+                    yield audio
+                    buffer.clear()
+                    if not first_chunk:
+                        first_chunk = True
+                        print(f"First chunk: {time.monotonic() - st:.2f} seconds")
 
-        audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+                curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                curr_tokens_mask = torch.cat(
+                    [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                ).unsqueeze(1)
+                curr_pos = curr_pos[:, -1:] + 1
 
-        # This applies an imperceptible watermark to identify audio as AI-generated.
-        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+            if len(buffer) >= BATCH_SIZE:
+                audio = self._audio_tokenizer.decode(torch.stack(buffer).permute(1, 2, 0)).squeeze(0).squeeze(0)
+                yield audio
+        
+        print(f"Total time: {time.monotonic() - st:.2f} seconds")
+        print(f"Total samples: {counter}")
 
-        return audio
+def load_csm_1b(
+        csm_model_path: str,
+        llama_model_path: str,
+        mimi_model_path: str,
+        device: str = "cuda",
+        ) -> Generator:
+    logger.info("Loading CSM 1B model from %s", csm_model_path)
 
+    model = Model.from_pretrained(csm_model_path, local_files_only=True)
 
-def load_csm_1b(device: str = "cuda") -> Generator:
-    model = Model.from_pretrained("sesame/csm-1b")
+    # model = torch.compile(
+    #     model,
+    #     dynamic=True,
+    #     fullgraph=True,
+    #     backend='cudagraphs'
+    # )
+
     model.to(device=device, dtype=torch.bfloat16)
 
-    generator = Generator(model)
+    generator = Generator(model, llama_model_path, mimi_model_path)
     return generator
