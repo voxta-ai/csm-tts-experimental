@@ -19,6 +19,7 @@ class CSMTest:
         parser.add_argument("--csm-model-path", required=True)
         parser.add_argument("--mimi-path", required=True)
         parser.add_argument("--llama-path", required=True)
+        parser.add_argument("--num-codebooks", default=32, type=int)
         parser.add_argument("--output-path", required=True)
         parser.add_argument("--warmup-runs", default=1, type=int)
         parser.add_argument("--runs", default=5, type=int)
@@ -33,6 +34,7 @@ class CSMTest:
             csm_model_path=args.csm_model_path,
             llama_model_path=args.llama_path,
             mimi_model_path=args.mimi_path,
+            num_codebooks=args.num_codebooks,
         )
 
         self.output_path = args.output_path

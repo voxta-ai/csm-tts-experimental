@@ -50,7 +50,7 @@ class Generator:
 
         device = next(model.parameters()).device
         mimi = loaders.get_mimi(mimi_model_path, device=device)
-        mimi.set_num_codebooks(32)
+        mimi.set_num_codebooks(model.config.audio_num_codebooks)
         self._audio_tokenizer = mimi
 
         self.sample_rate = mimi.sample_rate
@@ -63,8 +63,8 @@ class Generator:
         frame_masks = []
 
         text_tokens = self._text_tokenizer.encode(f"[{speaker}]{text}")
-        text_frame = torch.zeros(len(text_tokens), 33).long()
-        text_frame_mask = torch.zeros(len(text_tokens), 33).bool()
+        text_frame = torch.zeros(len(text_tokens), self._audio_tokenizer.num_codebooks + 1).long()
+        text_frame_mask = torch.zeros(len(text_tokens), self._audio_tokenizer.num_codebooks + 1).bool()
         text_frame[:, -1] = torch.tensor(text_tokens)
         text_frame_mask[:, -1] = True
 
@@ -86,8 +86,8 @@ class Generator:
         eos_frame = torch.zeros(audio_tokens.size(0), 1).to(self.device)
         audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
 
-        audio_frame = torch.zeros(audio_tokens.size(1), 33).long().to(self.device)
-        audio_frame_mask = torch.zeros(audio_tokens.size(1), 33).bool().to(self.device)
+        audio_frame = torch.zeros(audio_tokens.size(1), self._audio_tokenizer.num_codebooks + 1).long().to(self.device)
+        audio_frame_mask = torch.zeros(audio_tokens.size(1), self._audio_tokenizer.num_codebooks + 1).bool().to(self.device)
         audio_frame[:, :-1] = audio_tokens.transpose(0, 1)
         audio_frame_mask[:, :-1] = True
 
@@ -286,6 +286,7 @@ def load_csm_1b(
         csm_model_path: str,
         llama_model_path: str,
         mimi_model_path: str,
+        num_codebooks: int,
         device: str = "cuda",
         ) -> Generator:
     logger.info("Loading CSM 1B model from %s", csm_model_path)
@@ -299,14 +300,22 @@ def load_csm_1b(
         decoder_flavor="llama-100M",
         text_vocab_size=128256,
         audio_vocab_size=2051,
-        audio_num_codebooks=32,
+        audio_num_codebooks=num_codebooks, # 32, 24, 16, 12, 8
     )
     model = Model(config=model_args).to(device=device, dtype=torch.bfloat16)
     state_dict = load_file(csm_model_path)
+    
+    if(num_codebooks != 32):
+        state_dict['audio_head'] = state_dict['audio_head'][:model_args.audio_num_codebooks - 1]
+        vocab = model_args.audio_vocab_size
+        state_dict['audio_embeddings.weight'] = state_dict['audio_embeddings.weight'][:vocab * model_args.audio_num_codebooks]
 
     model.load_state_dict(state_dict)
     model.decoder = torch.compile(model.decoder, fullgraph=True, backend='cudagraphs')
     model.forward = torch.compile(model.forward, mode="max-autotune")
 
     generator = Generator(model, llama_model_path, mimi_model_path)
+    
+    logger.info(f"MIMI encoder uses {generator._audio_tokenizer.num_codebooks} / {model.config.audio_num_codebooks} codebooks")
+    
     return generator
