@@ -192,13 +192,16 @@ class Generator:
         out_masks = []
         with self._audio_tokenizer.streaming(batch_size=1):
             i = 0
-            while i < max_generation_len:
+            while counter < max_generation_len:
                 batch_end = min(i + batch_size, max_generation_len)
                 batch_size_actual = batch_end - i
 
                 batch_samples = []
 
                 for _ in range(batch_size_actual):
+                    if counter >= max_generation_len:
+                        break
+
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                         sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
 
@@ -316,6 +319,6 @@ def load_csm_1b(
 
     generator = Generator(model, llama_model_path, mimi_model_path)
     
-    logger.info(f"MIMI encoder uses {generator._audio_tokenizer.num_codebooks} / {model.config.audio_num_codebooks} codebooks")
+    logger.info(f"MIMI encoder uses {generator._audio_tokenizer.num_codebooks} / 32 codebooks")
     
     return generator
