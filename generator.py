@@ -124,7 +124,7 @@ class Generator:
     
     def create_segment(self, speaker: int, text: str, audio: Optional[torch.Tensor]) -> Segment:
         if audio is None:
-            audio = torch.zeros(0, device=self.device)
+            audio = torch.zeros(7, device=self.device)
         tokens, masks = self._tokenize_segment(speaker, text, audio)
         segment = Segment(speaker=speaker, text=text, tokens=tokens, masks=masks)
         if len(self._cache) >= 8:

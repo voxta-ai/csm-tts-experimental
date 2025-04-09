@@ -25,6 +25,7 @@ class CSMTest:
         parser.add_argument("--runs", default=5, type=int)
         parser.add_argument("--play-test", default=False, action="store_true")
         parser.add_argument("--text", default="Hello, I am a conversational speech model made by Sesame. I'm saying something a bit long so we reach the total amount of tokens and we're sure to be cut off.")
+        parser.add_argument("--text2", default=None, type=str)
         parser.add_argument("--max-duration", default=30, type=int)
         parser.add_argument("--voice-wav", default=None, type=str)
         parser.add_argument("--voice-transcript", default=None, type=str)
@@ -43,6 +44,7 @@ class CSMTest:
         self.play_test = args.play_test
 
         self.text = args.text
+        self.text2 = args.text2
         self.max_duration = args.max_duration
 
         voice_audio =self.load_audio(args.voice_wav)
@@ -61,18 +63,22 @@ class CSMTest:
 
         if self.warmup_runs > 0:
             for i in range(self.warmup_runs):
-                bytes = self.run_one()
+                bytes1 = self.run_one()
+                bytes2 = self.run_two()
                 if i == 0:
-                    self.save_audio(bytes, 0)
+                    self.save_audio(bytes1, 0, 1)
+                    self.save_audio(bytes2, 0, 2)
 
         if self.runs > 0:
             timings = []    
             for i in range(self.runs):
                 id += 1
                 st = time.monotonic()
-                bytes = self.run_one()
+                bytes1 = self.run_one()
+                bytes2 = self.run_two()
                 timings.append(time.monotonic() - st)
-                self.save_audio(bytes, i)
+                self.save_audio(bytes1, i, 1)
+                self.save_audio(bytes2, i, 2)
             
             # Calculate statistics
             mean_time = statistics.mean(timings)
@@ -94,9 +100,36 @@ class CSMTest:
         ):
             buffer.write((chunk.numpy() * 32767).astype("int16").tobytes())
         return buffer.getvalue()
+    
+    def run_two(self) -> bytes:
+        if self.text2 is None:
+            return None
+        context = [
+            self.context[0],
+            self.generator.create_segment(
+                speaker=1,
+                text="I'm good, thanks!",
+                audio=None
+            ),
+            self.generator.get_segment(
+                speaker=0,
+                text=self.text,
+            )
+        ]
+        buffer = io.BytesIO()
+        for chunk in self.generator.generate_stream(
+            speaker=0,
+            text=self.text2,
+            context=context,
+            max_audio_length_ms=self.max_duration * 1000,
+        ):
+            buffer.write((chunk.numpy() * 32767).astype("int16").tobytes())
+        return buffer.getvalue()
         
-    def save_audio(self, bytes, i):
-        tmp_file = os.path.join(self.output_path, "csm-" + str(i) + ".wav")
+    def save_audio(self, bytes, i, turn=0):
+        if bytes is None:
+            return
+        tmp_file = os.path.join(self.output_path, "csm-" + str(i) + "-" + str(turn) + ".wav")
         try:
             os.remove(tmp_file)
         except FileNotFoundError:
