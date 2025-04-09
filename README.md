@@ -23,6 +23,11 @@ python test.py --model-path path/to/model.gguf --snac-path path/to/snac-folder -
 
 For arguments, see [test.py](./test.py)
 
+## Credits
+
+Credits go to CSM creators: [Sesame Conversational Speech Model](https://github.com/SesameAILabs/csm)
+Also thanks to @davidbrowne17 for sharing their streaming implementation: [davidbrowne17/csm-streaming](https://github.com/davidbrowne17/csm-streaming)
+
 ## License
 
 Inherited from Sesame CSM.
