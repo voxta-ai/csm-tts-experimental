@@ -5,8 +5,7 @@ import time
 from collections import OrderedDict
 
 import torch
-from safetensors.torch import load_file
-from models import Model, ModelArgs
+from models import Model
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
@@ -158,47 +157,69 @@ class Generator:
             raise ValueError(
                 f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
             )
-        
-        BATCH_SIZE = 10
-        BUFFER_SIZE = 10
-        buffer = []
+
+        zeros_1_1 = torch.zeros(1, 1).long().to(self.device)
+        zeros_mask_1_1 = torch.zeros(1, 1).bool().to(self.device)
+
+        def update_tokens(sample):
+            nonlocal curr_tokens, curr_tokens_mask, curr_pos
+            ones = torch.ones_like(sample).bool()
+            curr_tokens = torch.cat([sample, zeros_1_1], dim=1).unsqueeze(1)
+            curr_tokens_mask = torch.cat([ones, zeros_mask_1_1], dim=1).unsqueeze(1)
+            curr_pos = curr_pos[:, -1:] + 1
 
         st = time.monotonic()
-        first_sample = False
         first_chunk = False
         counter = 0
-        with self._audio_tokenizer.streaming(1):
-            for _ in range(max_generation_len):
-                sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-                counter += 1
-                if not first_sample:
-                    first_sample = True
-                    print(f"First sample: {time.monotonic() - st:.2f} seconds")
-                if torch.all(sample == 0):
-                    break  # eos
+        batch_size = 10
+        buffer_size = 30
+        frame_buffer = []
+        with self._audio_tokenizer.streaming(batch_size=1):
+            i = 0
+            while i < max_generation_len:
+                batch_end = min(i + batch_size, max_generation_len)
+                batch_size_actual = batch_end - i
 
-                buffer.append(sample)
+                batch_samples = []
 
-                if(len(buffer) >= BUFFER_SIZE):
-                    audio = self._audio_tokenizer.decode(torch.stack(buffer).permute(1, 2, 0)).squeeze(0).squeeze(0)
-                    yield audio
-                    buffer.clear()
+                for _ in range(batch_size_actual):
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                        sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+
+                    if torch.all(sample == 0):
+                        break
+
+                    counter += 1
+                    batch_samples.append(sample)
+                    update_tokens(sample)
+
+                if not batch_samples:
+                    break
+
+                frame_buffer.extend(batch_samples)
+                i += len(batch_samples)
+
+                if len(frame_buffer) >= buffer_size:
+                    frames_stacked = torch.stack(frame_buffer).permute(1, 2, 0)
+                    audio_chunk = self._audio_tokenizer.decode(frames_stacked).squeeze(0).squeeze(0)
+                    frame_buffer = []
+                    yield audio_chunk.cpu()
                     if not first_chunk:
                         first_chunk = True
-                        print(f"First chunk: {time.monotonic() - st:.2f} seconds")
+                        logger.info("First chunk: %.2f seconds", time.monotonic() - st)
 
-                curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
-                curr_tokens_mask = torch.cat(
-                    [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
-                ).unsqueeze(1)
-                curr_pos = curr_pos[:, -1:] + 1
+                # Why?
+                if i >= 100 and (i % 100 == 0):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
 
-            if len(buffer) >= BATCH_SIZE:
-                audio = self._audio_tokenizer.decode(torch.stack(buffer).permute(1, 2, 0)).squeeze(0).squeeze(0)
-                yield audio
-        
-        print(f"Total time: {time.monotonic() - st:.2f} seconds")
-        print(f"Total samples: {counter}")
+        if frame_buffer:
+            frames_stacked = torch.stack(frame_buffer).permute(1, 2, 0)
+            audio_chunk = self._audio_tokenizer.decode(frames_stacked).squeeze(0).squeeze(0)
+            cpu_chunk = audio_chunk.cpu()
+            yield cpu_chunk
+
+        print(f"Total time: {time.monotonic() - st:.2f} seconds ({counter} samples)")
 
 def load_csm_1b(
         csm_model_path: str,
