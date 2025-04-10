@@ -143,8 +143,19 @@ class Generator:
         topk: int = 30,
     ) -> Iterator[torch.Tensor]:
         self._model.reset_caches()
+        
+        counter = 0
+        batch_size = 10
+        buffer_size = 20 # 1.6s
+        skip_silence_duration = 1.6
+        stop_silence_duration = 4.8
+        silence_duration_counter = 0
+        silence_threshold = 0.05
+        sample_rate = 24000
 
         max_generation_len = int(max_audio_length_ms / 80)
+        max_generation_len = int(np.ceil(max_generation_len / buffer_size) * buffer_size)
+            
         tokens, tokens_mask = [], []
         for segment in context:
             tokens.append(segment.tokens)
@@ -180,13 +191,6 @@ class Generator:
 
         st = time.monotonic()
         first_chunk = False
-        counter = 0
-        batch_size = 10
-        buffer_size = 20 # 1.6s
-        skip_silence_duration = 1.6
-        stop_silence_duration = 4.8
-        silence_threshold = 0.05
-        sample_rate = 24000
         frame_buffer = []
         out_tokens = []
         out_masks = []
@@ -232,9 +236,18 @@ class Generator:
                 i += len(batch_samples)
 
                 if len(frame_buffer) >= buffer_size:
-                    frames_stacked = torch.stack(frame_buffer).permute(1, 2, 0)
+                    chunk = frame_buffer[:buffer_size]
+                    frame_buffer = frame_buffer[buffer_size:]
+                        
+                    # DEBUG
+                    frame_shapes = [frame.shape for frame in chunk]
+                    
+                    frames_stacked = torch.stack(chunk)
+                    frames_stacked = frames_stacked.permute(1, 2, 0)
+                    expected_tokens = self._audio_tokenizer.num_codebooks  # e.g. 32
+                    if frames_stacked.shape[1] != expected_tokens:
+                        logger.warning("Token mismatch: got %d tokens but expected %d", frames_stacked.shape[1], expected_tokens)
                     audio_chunk = self._audio_tokenizer.decode(frames_stacked).squeeze(0).squeeze(0)
-                    frame_buffer = []
 
                     # Check for silence in the decoded chunk
                     audio_np = audio_chunk.cpu().numpy()
@@ -256,7 +269,7 @@ class Generator:
 
                     if not first_chunk:
                         first_chunk = True
-                        logger.info(f"First chunk: {time.monotonic() - st:.2f} seconds, {counter} samples", )
+                        logger.debug(f"First chunk: {time.monotonic() - st:.2f} seconds, {counter} samples", )
 
                 if i >= 100 and (i % 100 == 0):
                     if torch.cuda.is_available():
@@ -292,7 +305,7 @@ def load_csm_1b(
         num_codebooks: int,
         device: str = "cuda",
         ) -> Generator:
-    logger.info("Loading CSM 1B model from %s", csm_model_path)
+    logger.debug("Loading CSM 1B model from %s", csm_model_path)
     
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -319,6 +332,6 @@ def load_csm_1b(
 
     generator = Generator(model, llama_model_path, mimi_model_path)
     
-    logger.info(f"MIMI encoder uses {generator._audio_tokenizer.num_codebooks} / 32 codebooks")
+    logger.debug(f"MIMI encoder uses {generator._audio_tokenizer.num_codebooks} / 32 codebooks")
     
     return generator
