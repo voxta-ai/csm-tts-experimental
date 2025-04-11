@@ -328,7 +328,7 @@ def load_csm_1b(
 
     model.load_state_dict(state_dict)
     model.decoder = torch.compile(model.decoder, fullgraph=True, backend='cudagraphs')
-    model.forward = torch.compile(model.forward, mode="max-autotune")
+    model.forward = torch.compile(model.forward, mode="reduce-overhead")
 
     generator = Generator(model, llama_model_path, mimi_model_path)
     

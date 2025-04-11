@@ -17,8 +17,8 @@ class CSMTest:
     def __init__(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--csm-model-path", required=True)
-        parser.add_argument("--mimi-path", required=True)
-        parser.add_argument("--llama-path", required=True)
+        parser.add_argument("--mimi-model-path", required=True)
+        parser.add_argument("--llama-model-path", required=True)
         parser.add_argument("--num-codebooks", default=32, type=int)
         parser.add_argument("--output-path", required=True)
         parser.add_argument("--warmup-runs", default=1, type=int)
@@ -33,8 +33,8 @@ class CSMTest:
 
         self.generator = load_csm_1b(
             csm_model_path=args.csm_model_path,
-            llama_model_path=args.llama_path,
-            mimi_model_path=args.mimi_path,
+            llama_model_path=args.llama_model_path,
+            mimi_model_path=args.mimi_model_path,
             num_codebooks=args.num_codebooks,
         )
 
