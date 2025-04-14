@@ -81,7 +81,9 @@ class Generator:
 
         # (K, T)
         audio = audio.to(self.device)
-        audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
+        audio_tokens = self._audio_tokenizer.encode(
+            audio.unsqueeze(0).unsqueeze(0)
+        )[0]
         # add EOS frame
         eos_frame = torch.zeros(audio_tokens.size(0), 1).to(self.device)
         audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
@@ -91,10 +93,7 @@ class Generator:
         audio_frame[:, :-1] = audio_tokens.transpose(0, 1)
         audio_frame_mask[:, :-1] = True
 
-        frame_tokens.append(audio_frame)
-        frame_masks.append(audio_frame_mask)
-
-        return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
+        return audio_frame, audio_frame_mask
 
     def _tokenize_segment(self, speaker: int, text: str, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
